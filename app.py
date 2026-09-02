@@ -40,6 +40,24 @@ def fuzzy_ratio(a: str, b: str) -> float:
         return 0.0
     return SequenceMatcher(None, a.strip().lower(), b.strip().lower()).ratio()
 
+def normalize_volume(val: str) -> Optional[float]:
+    """Standardizes liquid volume statements (mL, L, Liters, fl oz) to milliliters."""
+    if not val:
+        return None
+    val_clean = val.lower().replace(",", ".")
+    num_match = re.search(r"(\d+(?:\.\d+)?)", val_clean)
+    if not num_match:
+        return None
+    amount = float(num_match.group(1))
+
+    if any(u in val_clean for u in ["liter", "liters", "ltr"]) or re.search(r"\b(l)\b", val_clean):
+        return round(amount * 1000, 1)
+    if any(u in val_clean for u in ["ml", "milliliter", "milliliters"]):
+        return round(amount, 1)
+    if any(u in val_clean for u in ["oz", "fl oz"]):
+        return round(amount * 29.5735, 1)
+    return round(amount, 1)
+
 def extract_label_data_groq_profiled(pil_image: Image.Image, api_key: str):
     # 1. Preprocessing & Compression profiling
     t_prep_start = time.perf_counter()
@@ -115,9 +133,12 @@ def evaluate_compliance(form_data: dict, extracted: LabelExtraction):
     c_status = "PASS" if c_ratio >= 0.85 else ("REVIEW" if c_ratio >= 0.60 else "FAIL")
     checks.append({"Field": "Class/Type", "Application Form": form_data["class_type"], "Detected Artwork": extracted.class_type or "Not Found", "Status": c_status, "Notes": f"Match score: {int(c_ratio*100)}%"})
 
-    # 3. ABV Numeric Check (Parsed numerically to prevent 13 vs 13.0 mismatches)
-    f_num = re.findall(r"\d+(?:\.\d+)?", str(form_data["alcohol_content"]))
-    a_num = re.findall(r"\d+(?:\.\d+)?", extracted.alcohol_content or "")
+    # 3. ABV Numeric Check (Normalizes ',' to '.' for European decimal notation and checks proof)
+    clean_form_abv = str(form_data["alcohol_content"]).replace(",", ".")
+    clean_art_abv = (extracted.alcohol_content or "").replace(",", ".")
+
+    f_num = re.findall(r"\d+(?:\.\d+)?", clean_form_abv)
+    a_num = re.findall(r"\d+(?:\.\d+)?", clean_art_abv)
 
     if f_num and a_num:
         try:
@@ -135,12 +156,26 @@ def evaluate_compliance(form_data: dict, extracted: LabelExtraction):
         abv_status, abv_note = "FAIL", f"Mismatch: Form={form_data['alcohol_content']}, Label={extracted.alcohol_content}"
     checks.append({"Field": "Alcohol Content (ABV)", "Application Form": str(form_data["alcohol_content"]), "Detected Artwork": extracted.alcohol_content or "Not Found", "Status": abv_status, "Notes": abv_note})
 
-    # 4. Net Contents
-    n_ratio = fuzzy_ratio(form_data["net_contents"], extracted.net_contents or "")
-    n_status = "PASS" if n_ratio >= 0.85 else "FAIL"
-    checks.append({"Field": "Net Contents", "Application Form": form_data["net_contents"], "Detected Artwork": extracted.net_contents or "Not Found", "Status": n_status, "Notes": "Volume statement verified." if n_status == "PASS" else "Volume mismatch."})
+    # 4. Net Contents (Normalized Quantity Check)
+    form_vol = normalize_volume(form_data["net_contents"])
+    art_vol = normalize_volume(extracted.net_contents or "")
 
-    # 5. Country of Origin (only when applicable)
+    if form_vol and art_vol and abs(form_vol - art_vol) < 1.0:
+        n_status, n_note = "PASS", f"Volume equivalent verified ({form_vol} mL)."
+    elif not art_vol:
+        n_status, n_note = "FAIL", "No net contents statement detected on label."
+    else:
+        n_status, n_note = "FAIL", f"Volume mismatch: Form={form_data['net_contents']} vs Label={extracted.net_contents}"
+
+    checks.append({
+        "Field": "Net Contents",
+        "Application Form": form_data["net_contents"],
+        "Detected Artwork": extracted.net_contents or "Not Found",
+        "Status": n_status,
+        "Notes": n_note
+    })
+
+    # 5. Country of Origin (when applicable)
     if form_data.get("origin_required"):
         expected_origin = (form_data.get("country_of_origin") or "").strip()
         detected_origin = (extracted.country_of_origin or "").strip()
@@ -207,7 +242,7 @@ if not active_key:
     st.error("Groq API key missing. Add GROQ_API_KEY to your .env file or enter it in the sidebar.")
     st.stop()
 
-tab1, tab2 = st.tabs(["Single Application Review", "Batch Processing (Bulk)"])
+tab1, tab2 = st.tabs(["Single Application Review", "Batch Compliance Verification"])
 
 with tab1:
     col_left, col_right = st.columns([1, 1], gap="medium")
@@ -271,44 +306,114 @@ with tab1:
                     st.error(f"Processing error: {e}")
 
 with tab2:
-    st.subheader("Batch Queue Processor (Importers / High Volume)")
-    st.write("Upload multiple label images to process and triage them in bulk.")
-    batch_files = st.file_uploader("Select multiple label images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-    
-    if batch_files and st.button("Process Batch Queue"):
-        progress_bar = st.progress(0)
-        summary_rows = []
-        for i, file in enumerate(batch_files):
-            try:
-                img = Image.open(file)
-                extracted, _, m_time = extract_label_data_groq_profiled(img, active_key)
-                summary_rows.append({
-                    "Filename": file.name,
-                    "Detected Brand": extracted.brand_name,
-                    "Detected ABV": extracted.alcohol_content,
-                    "Detected Country of Origin": extracted.country_of_origin or "Not Found",
-                    "Warning Header OK": "PASS" if extracted.is_header_all_caps else "FAIL",
-                    "Latency (s)": m_time
-                })
-            except Exception:
-                summary_rows.append({
-                    "Filename": file.name, 
-                    "Detected Brand": "ERROR", 
-                    "Detected ABV": "ERROR", 
-                    "Detected Country of Origin": "ERROR", 
-                    "Warning Header OK": "ERROR", 
-                    "Latency (s)": "N/A"
-                })
-            progress_bar.progress((i + 1) / len(batch_files))
-        
-        df_results = pd.DataFrame(summary_rows)
-        st.dataframe(df_results, use_container_width=True)
+    st.subheader("Batch Compliance Verification (CSV + Image Matching)")
+    st.write("Upload a CSV manifest of COLA applications alongside the corresponding label artwork.")
 
-        csv_data = df_results.to_csv(index=False).encode("utf-8")
+    sample_csv = (
+        "filename,brand_name,class_type,alcohol_content,net_contents,country_of_origin\n"
+        "jim_beam.jpg,JIM BEAM,Kentucky Straight Bourbon Whiskey,45.0,750 mL,\n"
+        "castoro.png,CASTORO WINES,Cabernet Sauvignon,13.0,750 mL,\n"
+    )
+    st.download_button(
+        label="📄 Download Sample CSV Template",
+        data=sample_csv,
+        file_name="cola_batch_template.csv",
+        mime="text/csv",
+    )
+
+    col_b1, col_b2 = st.columns(2)
+    with col_b1:
+        csv_file = st.file_uploader("1. Upload Applications CSV", type=["csv"])
+    with col_b2:
+        batch_files = st.file_uploader(
+            "2. Upload Label Artwork Images", 
+            type=["png", "jpg", "jpeg"], 
+            accept_multiple_files=True
+        )
+
+    if csv_file and batch_files and st.button("Run Batch Verification", type="primary"):
+        try:
+            df_manifest = pd.read_csv(csv_file)
+            image_map = {f.name: f for f in batch_files}
+            
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            batch_results = []
+            
+            for i, row in df_manifest.iterrows():
+                fname = str(row.get("filename", "")).strip()
+                status_text.text(f"Processing ({i+1}/{len(df_manifest)}): {fname}")
+
+                if fname not in image_map:
+                    batch_results.append({
+                        "Filename": fname,
+                        "Brand": row.get("brand_name"),
+                        "Overall Verdict": "MISSING IMAGE",
+                        "Flags / Deficiencies": "Artwork file not found in upload queue",
+                        "Latency (s)": "N/A"
+                    })
+                    continue
+
+                try:
+                    img = Image.open(image_map[fname])
+                    extracted, _, m_time = extract_label_data_groq_profiled(img, active_key)
+                    
+                    form_dict = {
+                        "brand_name": str(row.get("brand_name", "")),
+                        "class_type": str(row.get("class_type", "")),
+                        "alcohol_content": str(row.get("alcohol_content", "")),
+                        "net_contents": str(row.get("net_contents", "")),
+                        "origin_required": pd.notna(row.get("country_of_origin")) and bool(str(row.get("country_of_origin")).strip()),
+                        "country_of_origin": str(row.get("country_of_origin", "")),
+                    }
+                    
+                    checks, overall, _ = evaluate_compliance(form_dict, extracted)
+                    failures = [c["Field"] for c in checks if c["Status"] == "FAIL"]
+                    reviews = [c["Field"] for c in checks if c["Status"] == "REVIEW"]
+                    
+                    flag_summary = []
+                    if failures:
+                        flag_summary.append("FAIL: " + ", ".join(failures))
+                    if reviews:
+                        flag_summary.append("REVIEW: " + ", ".join(reviews))
+                    if not flag_summary:
+                        flag_summary.append("All checks passed")
+
+                    batch_results.append({
+                        "Filename": fname,
+                        "Brand": form_dict["brand_name"],
+                        "Declared ABV": form_dict["alcohol_content"],
+                        "Detected ABV": extracted.alcohol_content,
+                        "Overall Verdict": overall,
+                        "Flags / Deficiencies": " | ".join(flag_summary),
+                        "Latency (s)": m_time
+                    })
+                except Exception as ex:
+                    batch_results.append({
+                        "Filename": fname,
+                        "Brand": row.get("brand_name"),
+                        "Overall Verdict": "ERROR",
+                        "Flags / Deficiencies": str(ex),
+                        "Latency (s)": "N/A"
+                    })
+
+                progress_bar.progress((i + 1) / len(df_manifest))
+
+            status_text.success("Batch processing complete!")
+            st.session_state["batch_results_df"] = pd.DataFrame(batch_results)
+
+        except Exception as e:
+            st.error(f"Error reading CSV manifest: {e}")
+
+    if "batch_results_df" in st.session_state:
+        df_out = st.session_state["batch_results_df"]
+        st.dataframe(df_out, use_container_width=True)
+
+        csv_out = df_out.to_csv(index=False).encode("utf-8")
         st.download_button(
-            label="📥 Export Results to CSV (Excel Compatible)",
-            data=csv_data,
-            file_name="ttb_batch_audit_results.csv",
+            label="📥 Download Compliance Report (CSV)",
+            data=csv_out,
+            file_name="batch_compliance_audit.csv",
             mime="text/csv",
             type="primary"
         )
