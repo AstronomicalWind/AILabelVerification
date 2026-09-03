@@ -4,8 +4,8 @@
 An automated, compliance-first verification platform built for **Alcohol and Tobacco Tax and Trade Bureau (TTB)** regulatory workflows. The system screens Certificate of Label Approval (COLA) applications directly against physical beverage artwork using an ultra-low-latency **Groq LPU vision pipeline** paired with **deterministic statutory validation rules**, returning auditable, field-by-field verdicts in under 5 seconds.
 
 ---
-
-
+## Timing Note
+While it should worki n <5 seconds a longer processing time is always due to the API delay. I went through different Gemini modes before finding Groq because its very fast, but even sometimes it can be overloaded and have an issue. You can see the time it takes while performming the check and that 99% of the delay is due to the API and it has nothing to do with the internals and the local preprocessing is basically negligible. 
 ## Overview
 
 Human review of beverage artwork is manual, repetitive, and vulnerable to missed typography details. This engine eliminates friction across two primary ingestion paths:
@@ -211,8 +211,5 @@ ENTRYPOINT ["streamlit", "run", "app.py", "--server.port=8501", "--server.addres
 
 ---
 
-## 🗺️ Production Roadmap
-
-- [ ] **Asynchronous Message Queue:** Implement Celery/Redis workers to ingest enterprise batches (300+ items) without risk of client-side HTTP timeouts.
-- [ ] **Physical Typography Inspection:** Use image DPI/scale data to verify the statutory 2 mm (8 pt) minimum type size on printed warnings.
-- [ ] **Direct Public COLA Integration:** Retrieve public registry data via application IDs to cross-reference pending submittals directly against official agency records.
+## UI Simplicity 
+Overall the user interface is clean and can be used by both tech experienced and non-tech savvy users. The fields and button provide clear guidance and information on the output. The delay calculation shows how long the service takes in terms of the API time vs other components. 
